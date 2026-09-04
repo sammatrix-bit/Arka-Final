@@ -8,3 +8,4 @@
 # پروتکل‌های مجاز: vless:// vmess:// trojan:// ss://
 # هر خط = یک لینک. خط خالی و خط‌هایی که با # شروع می‌شن نادیده گرفته می‌شن.
 
+vless://95378193-9efd-4ffa-b604-52d71a50328a@spiderpanel-production-f8f5.up.railway.app:443?encryption=none&security=tls&sni=spiderpanel-production-f8f5.up.railway.app&fp=chrome&alpn=http%2F1.1&insecure=0&allowInsecure=0&type=ws&host=spiderpanel-production-f8f5.up.railway.app&path=%2Fws%2F95378193-9efd-4ffa-b604-52d71a50328a#Spider-iran
