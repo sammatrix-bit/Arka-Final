@@ -24,7 +24,6 @@ class ConfigImporter(context: Context) {
 
     suspend fun isDatabaseEmpty(): Boolean = dao.countAll() == 0
 
-    /** ایمپورت (اولیه یا مجدد) از پنج فایل assets/*.txt. */
     suspend fun importFromAssets(): Map<ConnectionMode, Int> {
         val result = LinkedHashMap<ConnectionMode, Int>()
         for (mode in ConnectionMode.entries) {
@@ -35,7 +34,6 @@ class ConfigImporter(context: Context) {
         return result
     }
 
-    /** ایمپورت از متن کلیپ‌بورد برای یک بخش مشخص. */
     suspend fun importFromClipboard(mode: ConnectionMode, clipboardText: String): Int {
         val links = ConfigParser.parseLines(clipboardText)
         return insert(mode, links)
@@ -53,7 +51,6 @@ class ConfigImporter(context: Context) {
             )
         }
         val insertedIds = dao.insertAll(entities)
-        // OnConflictStrategy.IGNORE برمی‌گردونه -1 برای هر ردیفی که به خاطر تکراری بودنِ hash رد شده.
         return insertedIds.count { it != -1L }
     }
 
