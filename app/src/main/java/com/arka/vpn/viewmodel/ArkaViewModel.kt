@@ -36,11 +36,11 @@ import kotlinx.coroutines.withContext
  * منطق کامل صفحه اصلی.
  *
  * جریان واقعیِ اتصال:
- * 1) کانفیگ‌های واقعی دیتابیس رو با TCP handshake واقعی تست می‌کنه (مثل قبل).
+ * 1) کانفیگ‌های واقعی دیتابیس رو با تست واقعی سطح پروتکل (نه TCP ساده) تست می‌کنه.
  * 2) کانفیگ برنده رو با ConfigConverter به یک JSON واقعیِ Xray-core تبدیل می‌کنه.
  * 3) اجازه‌ی VPN اندروید رو می‌گیره (VpnService.prepare).
  * 4) ArkaVpnService واقعی رو استارت می‌کنه که TUN واقعی می‌سازه و به هسته‌ی Xray-core واقعی وصلش می‌کنه.
- * 5) وضعیت «متصل»، پینگ، و آمار ترافیک همه از هسته‌ی واقعی (ArkaCoreManager) خونده می‌شن — دیگه تایمر شبیه‌سازی‌شده نیست.
+ * 5) وضعیت «متصل»، پینگ، و آمار ترافیک همه از هسته‌ی واقعی (ArkaCoreManager) خونده می‌شن.
  */
 class ArkaViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -56,6 +56,7 @@ class ArkaViewModel(application: Application) : AndroidViewModel(application) {
 
     private var connectJob: Job? = null
     private var statsJob: Job? = null
+    private var connectTimeoutJob: Job? = null
     private var pendingConfigJson: String? = null
     private var pendingMode: ConnectionMode? = null
     private var realSpeedMbpsForGraph: Double = 0.0
@@ -68,6 +69,7 @@ class ArkaViewModel(application: Application) : AndroidViewModel(application) {
         autoImportOnFirstLaunch()
         startSparkline()
         watchRealCoreState()
+        watchConnectionErrors()
     }
 
     private fun autoImportOnFirstLaunch() {
@@ -198,7 +200,35 @@ class ArkaViewModel(application: Application) : AndroidViewModel(application) {
             putExtra(ArkaVpnService.EXTRA_CONFIG_JSON, configJson)
         }
         ContextCompat.startForegroundService(app, intent)
-        // وضعیت CONNECTED واقعاً وقتی ست می‌شه که ArkaCoreManager.isRunning از طریق watchRealCoreState() بالا بره
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = viewModelScope.launch {
+            delay(15_000)
+            if (_uiState.value.connectionState == ConnectionState.CONNECTING) {
+                stopRealVpnService()
+                pendingConfigJson = null
+                emitToast("اتصال به هسته بیش از حد طول کشید — این کانفیگ رو رد می‌کنیم")
+                _uiState.update { it.copy(connectionState = ConnectionState.IDLE, progress = 0f, activeConfig = null) }
+            }
+        }
+    }
+
+    private fun stopRealVpnService() {
+        val app = getApplication<Application>()
+        app.startService(Intent(app, ArkaVpnService::class.java).apply { action = ArkaVpnService.ACTION_DISCONNECT })
+    }
+
+    /** خطای واقعی از هسته یا سرویس (کانفیگ نامعتبر، اجازه رد شد، ...) — دیگه صفحه گیر نمی‌کنه. */
+    private fun watchConnectionErrors() {
+        viewModelScope.launch {
+            ArkaCoreManager.connectionError.collect { message ->
+                connectTimeoutJob?.cancel()
+                pendingConfigJson = null
+                emitToast("اتصال ناموفق: $message")
+                _uiState.update {
+                    it.copy(connectionState = ConnectionState.IDLE, progress = 0f, activeConfig = null, pingMs = null)
+                }
+            }
+        }
     }
 
     /** مرحله ۵: گوش دادن دائمی به وضعیت واقعی هسته — نه شبیه‌سازی. */
@@ -206,6 +236,7 @@ class ArkaViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             ArkaCoreManager.isRunning.collect { running ->
                 if (running) {
+                    connectTimeoutJob?.cancel()
                     _uiState.update { it.copy(connectionState = ConnectionState.CONNECTED, progress = 1f) }
                     pendingMode?.let { emitToast(it.connectedMessage) }
                     pendingConfigJson = null
@@ -266,42 +297,43 @@ class ArkaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** «سریع»: تا ۲۰ کانفیگ رو موازی تست می‌کنه، کم‌تاخیرترینِ سالم رو انتخاب می‌کنه. */
+    /** «سریع»: تا ۱۵ کانفیگ رو موازی تست می‌کنه (تست واقعی سطح پروتکل)، کم‌تاخیرترینِ سالم رو انتخاب می‌کنه. */
     private suspend fun searchFast(configs: List<ConfigEntity>): Found? {
-        val pool = configs.take(20)
+        val pool = configs.take(15)
         if (pool.isEmpty()) return null
-        val results = testBatch(pool, concurrency = 10, totalForProgress = pool.size)
+        val results = testBatch(pool, concurrency = 6, totalForProgress = pool.size)
         val best = results.filter { it.second.reachable }.minByOrNull { it.second.latencyMs }
         return best?.let { Found(it.first, it.second) }
     }
 
-    /** «عادی» / «ثابت» / «آمریکا»: به ترتیب تست می‌کنه و روی اولین کانفیگ سالم می‌ایسته. */
+    /** «عادی» / «ثابت» / «آمریکا»: به ترتیب تست واقعی می‌کنه و روی اولین کانفیگ سالم می‌ایسته. */
     private suspend fun searchFirstHealthy(configs: List<ConfigEntity>): Found? {
-        val pool = configs.take(15)
+        val pool = configs.take(10)
         if (pool.isEmpty()) return null
         val total = pool.size
+        val app = getApplication<Application>()
         for ((index, cfg) in pool.withIndex()) {
-            val result = ConfigTester.testReachability(cfg.link)
+            val result = ConfigTester.testReachability(app, cfg.link)
             _uiState.update { it.copy(progress = (index + 1) / total.toFloat()) }
             if (result.reachable) return Found(cfg, result)
         }
         return null
     }
 
-    /** «سخت»: لیست بزرگ رو موازی تست می‌کنه، اگه پاس اول هیچی پیدا نکرد یک بار دیگه امتحان می‌کنه. */
+    /** «سخت»: لیست بزرگ رو موازی تست واقعی می‌کنه، اگه پاس اول هیچی پیدا نکرد یک بار دیگه امتحان می‌کنه. */
     private suspend fun searchHard(configs: List<ConfigEntity>): Found? {
-        val pool = configs.take(300)
+        val pool = configs.take(150)
         if (pool.isEmpty()) return null
         val totalPlanned = pool.size * 2
 
-        val firstPass = testBatch(pool, concurrency = 15, totalForProgress = totalPlanned)
+        val firstPass = testBatch(pool, concurrency = 8, totalForProgress = totalPlanned)
         val firstHit = firstPass.filter { it.second.reachable }.minByOrNull { it.second.latencyMs }
         if (firstHit != null) {
             _uiState.update { it.copy(progress = 1f) }
             return Found(firstHit.first, firstHit.second)
         }
 
-        val secondPass = testBatch(pool, concurrency = 15, totalForProgress = totalPlanned, progressOffset = pool.size)
+        val secondPass = testBatch(pool, concurrency = 8, totalForProgress = totalPlanned, progressOffset = pool.size)
         _uiState.update { it.copy(progress = 1f) }
         val secondHit = secondPass.filter { it.second.reachable }.minByOrNull { it.second.latencyMs }
         return secondHit?.let { Found(it.first, it.second) }
@@ -313,11 +345,12 @@ class ArkaViewModel(application: Application) : AndroidViewModel(application) {
         totalForProgress: Int,
         progressOffset: Int = 0
     ): List<Pair<ConfigEntity, ConfigTester.TestResult>> = coroutineScope {
+        val app = getApplication<Application>()
         val completed = java.util.concurrent.atomic.AtomicInteger(progressOffset)
         configs.chunked(concurrency).flatMap { chunk ->
             chunk.map { cfg ->
                 async(Dispatchers.IO) {
-                    val result = ConfigTester.testReachability(cfg.link)
+                    val result = ConfigTester.testReachability(app, cfg.link)
                     val done = completed.incrementAndGet()
                     _uiState.update { it.copy(progress = done / totalForProgress.toFloat()) }
                     cfg to result
@@ -328,19 +361,18 @@ class ArkaViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun cancelConnecting() {
         connectJob?.cancel()
+        connectTimeoutJob?.cancel()
         pendingConfigJson = null
         pendingMode = null
-        val app = getApplication<Application>()
-        app.startService(Intent(app, ArkaVpnService::class.java).apply { action = ArkaVpnService.ACTION_DISCONNECT })
+        stopRealVpnService()
         _uiState.update { it.copy(connectionState = ConnectionState.IDLE, progress = 0f, activeConfig = null) }
         emitToast("اتصال لغو شد")
     }
 
     private fun disconnect() {
-        val app = getApplication<Application>()
-        app.startService(Intent(app, ArkaVpnService::class.java).apply { action = ArkaVpnService.ACTION_DISCONNECT })
+        connectTimeoutJob?.cancel()
+        stopRealVpnService()
         emitToast("اتصال قطع شد")
-        // بقیه‌ی ریست state (پینگ/تایمر/داده) خودکار توسط watchRealCoreState() وقتی isRunning=false بشه انجام می‌شه
     }
 
     private fun startSparkline() {
