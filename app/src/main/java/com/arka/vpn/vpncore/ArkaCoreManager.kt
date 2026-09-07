@@ -3,8 +3,11 @@ package com.arka.vpn.vpncore
 import android.content.Context
 import android.provider.Settings
 import go.Seq
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import libv2ray.CoreCallbackHandler
 import libv2ray.CoreController
@@ -29,6 +32,12 @@ object ArkaCoreManager {
 
     private val _lastStatusMessage = MutableStateFlow<String?>(null)
     val lastStatusMessage: StateFlow<String?> = _lastStatusMessage.asStateFlow()
+
+    // اگه startLoop شکست بخوره (کانفیگ نامعتبر، مشکل شبکه، ...)، اینجا خبر می‌ده —
+    // چون فقط ست کردن isRunning=false کافی نیست (اگه از قبل هم false بوده، StateFlow چیزی emit نمی‌کنه
+    // و UI برای همیشه توی حالت «در حال اتصال» گیر می‌کنه؛ این باگی بود که رفع شد).
+    private val _connectionError = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val connectionError: SharedFlow<String> = _connectionError.asSharedFlow()
 
     @Synchronized
     fun ensureInit(context: Context) {
@@ -68,13 +77,20 @@ object ArkaCoreManager {
 
     /** واقعاً هسته را با فایل‌دسکریپتور TUN اجرا می‌کند — بدون تونل شبیه‌سازی‌شده. */
     fun startLoop(context: Context, configJson: String, tunFd: Int) {
-        ensureInit(context)
-        controller?.startLoop(configJson, tunFd)
+        try {
+            ensureInit(context)
+            controller?.startLoop(configJson, tunFd)
+        } catch (e: Exception) {
+            _isRunning.value = false
+            _connectionError.tryEmit(e.message ?: e.javaClass.simpleName)
+        }
     }
 
     fun stopLoop() {
         try {
             controller?.stopLoop()
+        } catch (e: Exception) {
+            // اگه هسته اصلاً بالا نیومده بود، stopLoop خودش ممکنه خطا بده — بی‌خطره، فقط پاکسازی می‌کنیم
         } finally {
             _isRunning.value = false
         }
@@ -89,6 +105,25 @@ object ArkaCoreManager {
         } catch (e: Exception) {
             -1L
         }
+
+    /**
+     * تست واقعیِ سطح پروتکل روی یک کانفیگ منفرد — بدون نیاز به وصل شدن واقعی یا اجازه‌ی VPN.
+     * خودِ Xray-core این outbound رو واقعاً می‌سازه و یک درخواست HTTP از توش رد می‌کنه.
+     * دقیقاً همون کاری که دکمه‌ی «تست» در v2rayNG / NekoBox انجام می‌ده — نه صرفاً TCP handshake.
+     * برمی‌گردونه: تاخیر واقعی به میلی‌ثانیه، یا -1 اگه واقعاً کار نکرد (رمز غلط، سرور رد کرد، ...).
+     */
+    fun measureOutboundDelay(
+        context: Context,
+        testConfigJson: String,
+        url: String = "https://www.gstatic.com/generate_204"
+    ): Long {
+        ensureInit(context)
+        return try {
+            Libv2ray.measureOutboundDelay(testConfigJson, url)
+        } catch (e: Exception) {
+            -1L
+        }
+    }
 
     /** آمار واقعی آپلود/دانلود از هسته — قالب Go: "tag,direction,value;tag,direction,value;..." */
     fun queryTrafficStats(): List<Triple<String, String, Long>> {
@@ -107,5 +142,9 @@ object ArkaCoreManager {
             }
         }
         return result
+    }
+
+    fun reportError(message: String) {
+        _connectionError.tryEmit(message)
     }
 }
