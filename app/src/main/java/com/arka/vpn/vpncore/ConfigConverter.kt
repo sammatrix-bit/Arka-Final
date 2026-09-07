@@ -76,6 +76,23 @@ object ConfigConverter {
         })
     }
 
+    /**
+     * یک کانفیگ کوچک فقط برای تست واقعی (نه اتصال واقعی) — بدون tun inbound.
+     * با Libv2ray.measureOutboundDelay ازش استفاده می‌شود تا واقعاً یک درخواست از توی همان
+     * پروکسی رد شود و ببیند واقعاً جواب می‌دهد یا نه (نه فقط اینکه پورت باز است).
+     */
+    fun buildTestConfig(link: String): String? {
+        val outbound = toOutboundJson(link) ?: return null
+        val root = JSONObject().apply {
+            put("log", JSONObject().put("loglevel", "warning"))
+            put("outbounds", JSONArray().apply {
+                put(outbound)
+                put(directOutbound())
+            })
+        }
+        return root.toString()
+    }
+
     private fun directOutbound(): JSONObject = JSONObject().apply {
         put("tag", "direct")
         put("protocol", "freedom")
@@ -197,7 +214,7 @@ object ConfigConverter {
 
         val network = params["type"] ?: "tcp"
         val headerType = params["headerType"] ?: "none"
-        // تروجان طبق قرارداد پیش‌فرض روی TLS کار می‌کنه مگر صریحاً security=none باشه
+        // تروجان طبق قرارداد پیش‌فرض روی TLS کار می‌کند مگر صریحاً security=none باشد
         val security = params["security"] ?: "tls"
         val sni = params["sni"] ?: params["peer"] ?: host
         val streamHost = params["host"] ?: sni
